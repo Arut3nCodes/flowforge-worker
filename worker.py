@@ -1,12 +1,17 @@
 import pika
+import os
+import time
 import json
 
 JOBS_EXCHANGE = "jobs_exchange"
 RESULTS_EXCHANGE = "results_exchange"
 
+# Pobieranie hosta RabbitMQ z ENV
+RABBIT_HOST = os.getenv("RABBIT_HOST", "localhost")
+
 def on_job(ch, method, properties, body):
+    payload = body.decode("utf-8", errors="replace")
     routing_key = method.routing_key
-    payload = body.decode()
 
     print(f"[x] Received job via {routing_key}: {payload}")
 
@@ -32,9 +37,16 @@ def on_job(ch, method, properties, body):
 
 
 def main():
-    connection = pika.BlockingConnection(
-        pika.ConnectionParameters(host="localhost")
-    )
+    while True:
+        try:
+            connection = pika.BlockingConnection(
+                pika.ConnectionParameters(host=RABBIT_HOST)
+            )
+            break
+        except pika.exceptions.AMQPConnectionError:
+            print(f"[!] Cannot connect to RabbitMQ at {RABBIT_HOST}, retrying in 5s...")
+            time.sleep(5)
+
     channel = connection.channel()
 
     channel.exchange_declare(exchange=JOBS_EXCHANGE, exchange_type="topic", durable=True)
