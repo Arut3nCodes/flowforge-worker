@@ -42,7 +42,7 @@ class Worker:
             return urljoin(url, random.choice(valid_links))
         return None
 
-    def perform_request(self, method, url, data=None, timeout=5.0):
+    def perform_request(self, method, url, data=None, timeout=5.0, scenario_step=0):
         start_time = time.time()
         error_msg = None
         status_code = 0
@@ -57,6 +57,7 @@ class Worker:
             
             status_code = response.status_code
             response_size = len(response.content) # Liczymy bajty
+            ttfb_ms = response.elapsed.total_seconds() * 1000
             
         except requests.exceptions.RequestException as e:
             # Obsługa błędów sieciowych (nie HTTP)
@@ -73,10 +74,12 @@ class Worker:
             'method': method,
             'endpoint': path,
             'status_code': status_code,
-            'latency_ms': latency,
+            'latency_ms': round(latency, 2),
+            'ttfb_ms': round(ttfb_ms, 2),
             'response_size_bytes': response_size,
             'error_msg': error_msg,
-            'is_success': (200 <= status_code < 300) and (error_msg is None)
+            'is_success': (200 <= status_code < 300) and (error_msg is None),
+            'scenario_step': scenario_step
         }
 
         self.send_result(method, result)
@@ -129,6 +132,7 @@ class Worker:
         time.sleep(wait_time)
 
     def run_crawl_session(self, config): 
+        timeout = config.get('timeout', 2.0)
         think_time_avg = config.get('think_time_avg', 2.0)
         think_time_var = config.get('think_time_var', 0.5)
         self.target_url = config.get('target_url', 'http://localhost:8080')
@@ -146,7 +150,7 @@ class Worker:
         current_url = self.target_url
 
         for step in range(session_depth):
-            response, status = self.perform_request('GET', current_url)
+            response, status = self.perform_request('GET', current_url, timeout=timeout, scenario_step=step)
             
             if not response or status != 200:
                 break
