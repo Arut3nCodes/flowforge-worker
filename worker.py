@@ -42,7 +42,7 @@ class Worker:
             return urljoin(url, random.choice(valid_links))
         return None
 
-    def perform_request(self, method, url, data=None, timeout=5.0, scenario_step=0):
+    def perform_request(self, method, url, data=None, timeout=5.0, scenario_step=0, job_id=0):
         start_time = time.time()
         error_msg = None
         status_code = 0
@@ -69,6 +69,7 @@ class Worker:
         latency = (time.time() - start_time) * 1000
         path = url.replace(self.target_url, '') if self.target_url in url else url
         result = {
+            'job_id': job_id,
             'worker_id': WORKER_ID,
             'timestamp': datetime.now().isoformat(),
             'method': method,
@@ -132,6 +133,7 @@ class Worker:
         time.sleep(wait_time)
 
     def run_crawl_session(self, config): 
+        job_id = config.get('job_id', 0)
         timeout = config.get('timeout', 2.0)
         think_time_avg = config.get('think_time_avg', 2.0)
         think_time_var = config.get('think_time_var', 0.5)
@@ -150,7 +152,7 @@ class Worker:
         current_url = self.target_url
 
         for step in range(session_depth):
-            response, status = self.perform_request('GET', current_url, timeout=timeout, scenario_step=step)
+            response, status = self.perform_request('GET', current_url, timeout=timeout, scenario_step=step, job_id=job_id)
             
             if not response or status != 200:
                 break
