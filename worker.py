@@ -12,11 +12,12 @@ import math
 
 JOBS_EXCHANGE = "jobs_exchange"
 RESULTS_EXCHANGE = "results_exchange"
+RESULTS_QUEUE = "results_queue"
 
 # Pobieranie hosta RabbitMQ z ENV
 RABBIT_HOST = os.getenv("RABBIT_HOST", "localhost")
 # Unikalny identyfikator workera (z ENV lub losowy)
-WORKER_ID = os.getenv('WORKER_ID', f"worker-{random.randint(1000, 9999)}")
+WORKER_ID = os.getenv('WORKER_ID', f"{random.randint(1000, 9999)}")
 # Konfiguracja loggera
 logging.basicConfig(level=logging.INFO, format=f'%(asctime)s [{WORKER_ID}] : %(message)s')
 logger = logging.getLogger(__name__)
@@ -47,27 +48,26 @@ class Worker:
         error_msg = None
         status_code = 0
         response_size = 0
+        ttfb_ms = 0 # Zainicjowane, aby uniknąć błędu przy awarii requestu
         
         try:
-            # Użycie timeout z wiadomości IN
             if method == 'GET':
                 response = self.session.get(url, timeout=timeout)
             else:
                 response = self.session.post(url, data=data, timeout=timeout)
             
             status_code = response.status_code
-            response_size = len(response.content) # Liczymy bajty
+            response_size = len(response.content)
             ttfb_ms = response.elapsed.total_seconds() * 1000
             
         except requests.exceptions.RequestException as e:
-            # Obsługa błędów sieciowych (nie HTTP)
             logger.error(f"Request failed: {e}")
             error_msg = str(e)
-            status_code = 0 
             response = None
             
         latency = (time.time() - start_time) * 1000
         path = url.replace(self.target_url, '') if self.target_url in url else url
+        
         result = {
             'job_id': job_id,
             'worker_id': WORKER_ID,
@@ -83,74 +83,53 @@ class Worker:
             'scenario_step': scenario_step
         }
 
-        self.send_result(method, result)
+        self.send_result(result)
         return response, status_code
 
     def send_result(self, result):
-        if self.channel:
+        if self.channel and self.channel.is_open:
+            # Poprawione: wysyłanie do konkretnego exchange z routing key
             self.channel.basic_publish(
-                exchange='', 
-                routing_key=RESULTS_EXCHANGE, 
-                body=json.dumps(result)
+                exchange=RESULTS_EXCHANGE, 
+                routing_key="result.update", 
+                body=json.dumps(result),
+                properties=pika.BasicProperties(content_type='application/json', delivery_mode=2) # trwała wiadomość
             )
 
     def calculate_lognorm_params(self, desired_mean, desired_std_dev):
-        """
-        Przelicza oczekiwaną średnią (np. 4 sekundy) i odchylenie (rozrzut)
-        na parametry mu i sigma wymagane przez rozkład Log-Normalny.
-        """
-        # Wzory matematyczne na konwersję momentów:
-        # sigma^2 = ln(1 + (Var / Mean^2))
-        # mu = ln(Mean) - 0.5 * sigma^2
-        
         variance = desired_std_dev ** 2
         sigma_sq = math.log(1 + (variance / (desired_mean ** 2)))
-        
         sigma = math.sqrt(sigma_sq)
         mu = math.log(desired_mean) - 0.5 * sigma_sq
-        
         return mu, sigma
 
     def think(self, avg_time, std_dev):
-        """
-        Symuluje czas namysłu używając rozkładu Log-Normalnego.
-        avg_time: Średni czas oczekiwania w sekundach (oczekiwany przez użytkownika).
-        std_dev: Odchylenie standardowe czasu oczekiwania w sekundach.
-        """
         if avg_time <= 0: return
-
-        # Obliczamy matematyczne parametry rozkładu
         mu, sigma = self.calculate_lognorm_params(avg_time, std_dev)
-        
-        # Losujemy czas
         wait_time = random.lognormvariate(mu, sigma)
-        
-        # Opcjonalnie: Limit górny (Hard cap), żeby worker nie zasnął na godzinę
-        # przy skrajnie rzadkim wylosowaniu z "ogona" rozkładu.
         wait_time = min(wait_time, avg_time * 10) 
-
         logger.info(f"Myślę... {wait_time:.2f}s")
         time.sleep(wait_time)
 
-    def run_crawl_session(self, config): 
-        job_id = config.get('job_id', 0)
-        timeout = config.get('timeout', 2.0)
-        think_time_avg = config.get('think_time_avg', 2.0)
-        think_time_var = config.get('think_time_var', 0.5)
-        self.target_url = config.get('target_url', 'http://localhost:8080')
-        user_agent = config.get('user_agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3')
+    def run_crawl_session(self, config):
+        print(config) 
+        job_id = config.get('jobId', 0)
+        timeout = config.get('timeOut', 2.0)
+        think_time_avg = config.get('thinkTimeAvg', 2.0)
+        think_time_var = config.get('thinkTimeVar', 0.5)
+        self.target_url = config.get('targetUrl', 'http://localhost:8080')
+        user_agent = config.get('userAgent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
+        
         self.session.headers.update({
             'User-Agent': user_agent,
             'Accept-Language': 'pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7', 
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8'
         })
         
-        logger.info(f"Ustawiono User-Agent: {user_agent[:30]}...")
         session_depth = config.get('depth', 1)
-        logger.info(f"--- NOWA SESJA (Głębokość: {session_depth}) ---")
-
         current_url = self.target_url
-
+        print(f"Rozpoczynam sesję crawl na {self.target_url} z głębokością {session_depth}")
+        
         for step in range(session_depth):
             response, status = self.perform_request('GET', current_url, timeout=timeout, scenario_step=step, job_id=job_id)
             
@@ -170,55 +149,52 @@ class Worker:
             else:
                 break
 
-
     def start(self):
         def callback(ch, method, properties, body):
-            cfg = json.loads(body)
-            payload = body.decode("utf-8", errors="replace")
-            routing_key = method.routing_key
+            try:
+                cfg = json.loads(body)
+                logger.info(f"[x] Otrzymano zadanie: {body.decode()[:100]}...")
 
-            logger.info(f"[x] Received job via {routing_key}: {payload}")
+                start_delay = cfg.get('start_delay', 0)
+                if start_delay > 0:
+                    time.sleep(start_delay)
 
-            start_delay = cfg.get('start_delay', 0)
-                    
-            if start_delay > 0:
-                logger.info(f"Otrzymano zadanie. Oczekiwanie na start (Ramp-up): {start_delay}s...")
-                time.sleep(start_delay)
-            else:
-                logger.info("Otrzymano zadanie. Start natychmiastowy.")
-            # ---------------------------------------------------
+                self.run_crawl_session(cfg)
+                ch.basic_ack(delivery_tag=method.delivery_tag)
+                logger.info("Zadanie zakończone.")
+            except Exception as e:
+                logger.error(f"Błąd podczas przetwarzania zadania: {e}")
+                # Odrzucenie wiadomości w razie krytycznego błędu (opcjonalnie)
+                ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
 
-            self.run_crawl_session(cfg)
-            
-            ch.basic_ack(delivery_tag=method.delivery_tag)
-            logger.info("Zadanie zakończone. Czekam na kolejne.")
-        #---------------------------------------------------
         while True:
             try:
-                connection = pika.BlockingConnection(
-                    pika.ConnectionParameters(host=RABBIT_HOST)
-                )
-                break
+                connection = pika.BlockingConnection(pika.ConnectionParameters(host=RABBIT_HOST))
+                self.channel = connection.channel()
+                
+                # Deklaracja Exchange
+                self.channel.exchange_declare(exchange=JOBS_EXCHANGE, exchange_type="topic", durable=True)
+                self.channel.exchange_declare(exchange=RESULTS_EXCHANGE, exchange_type="topic", durable=True)
+
+                # Kolejka zadań (Jobs)
+                self.channel.queue_declare(queue="jobs_queue", durable=True)
+                self.channel.queue_bind(exchange=JOBS_EXCHANGE, queue="jobs_queue", routing_key="job.*")
+
+                # Kolejka wyników (Results) - Dodano, aby wiadomości nie znikały
+                self.channel.queue_declare(queue=RESULTS_QUEUE, durable=True)
+                self.channel.queue_bind(exchange=RESULTS_EXCHANGE, queue=RESULTS_QUEUE, routing_key="result.#")
+
+                logger.info(" [*] Worker gotowy. Czekam na zadania...")
+                self.channel.basic_qos(prefetch_count=1) # Przetwarzaj tylko 1 zadanie na raz
+                self.channel.basic_consume(queue="jobs_queue", on_message_callback=callback)
+                self.channel.start_consuming()
+
             except pika.exceptions.AMQPConnectionError:
-                print(f"[!] Cannot connect to RabbitMQ at {RABBIT_HOST}, retrying in 5s...")
+                logger.warning(f"[!] Brak połączenia z RabbitMQ ({RABBIT_HOST}), ponowienie za 5s...")
                 time.sleep(5)
-
-        self.channel = connection.channel()
-
-        self.channel.exchange_declare(exchange=JOBS_EXCHANGE, exchange_type="topic", durable=True)
-        self.channel.exchange_declare(exchange=RESULTS_EXCHANGE, exchange_type="topic", durable=True)
-
-        self.channel.queue_declare(queue="jobs_queue", durable=True)
-        self.channel.queue_bind(
-            exchange=JOBS_EXCHANGE,
-            queue="jobs_queue",
-            routing_key="job.*"
-        )
-
-        print(" [*] Python worker waiting for jobs...")
-        self.channel.basic_consume(queue="jobs_queue", on_message_callback=callback)
-
-        self.channel.start_consuming()
+            except Exception as e:
+                logger.error(f"Nieoczekiwany błąd: {e}")
+                time.sleep(5)
 
 if __name__ == "__main__":
     worker = Worker()
